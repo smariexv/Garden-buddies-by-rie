@@ -1,0 +1,1154 @@
+<!DOCTYPE html><html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🍃 Garden Buddies by rie 🌸</title>
+<style>
+  :root {
+    --bg: #FBF3E4;
+    --bg-soft: #FCE8DF;
+    --pink-light: #FDEEEE;
+    --pink: #F5CDD1;
+    --rose: #E8A0A8;
+    --deep-rose: #C77484;
+    --wine: #8E3D4D;
+    --cream: #FFFBF3;
+    --text: #5A3E45;
+    --text-soft: #8A6C73;
+    --gold: #C9A876;
+    --border: #ECD3D5;
+    --shadow: rgba(142, 61, 77, 0.12);
+    --serif: 'Didot', 'Bodoni 72', 'Cormorant Garamond', Georgia, serif;
+    --sans: 'Avenir Next', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+  html, body { margin: 0; padding: 0; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    color: var(--text);
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at 8% 12%, var(--pink-light) 0%, transparent 32%),
+      radial-gradient(circle at 92% 18%, var(--bg-soft) 0%, transparent 35%),
+      radial-gradient(circle at 50% 82%, rgba(245, 205, 209, 0.27) 0%, transparent 42%),
+      var(--bg);
+    padding: 24px 14px 60px;
+  }
+  .container { max-width: 760px; margin: 0 auto; }
+
+  /* Header */
+  .header { text-align: center; padding: 12px 0 24px; position: relative; }
+  .eyebrow {
+    font-size: 11px; letter-spacing: 0.28em; text-transform: uppercase;
+    color: var(--deep-rose); margin-bottom: 10px; font-weight: 700;
+  }
+  .title {
+    font-family: var(--serif);
+    font-size: clamp(30px, 7vw, 42px); font-weight: 500; font-style: italic;
+    color: var(--wine); margin: 0 0 6px;
+    line-height: 1.1; letter-spacing: -0.01em;
+  }
+  .byline {
+    font-size: 13px; color: var(--deep-rose); margin: 0 0 10px;
+    font-family: var(--serif); font-style: italic; letter-spacing: 0.04em;
+  }
+  .subtitle { font-size: 13px; color: var(--text-soft); margin: 0; }
+  .divider {
+    display: flex; align-items: center; justify-content: center;
+    gap: 10px; margin: 16px 0 4px; color: var(--rose); font-size: 14px;
+  }
+  .divider-line {
+    height: 1px; flex: 1; max-width: 110px;
+    background: linear-gradient(to right, transparent, var(--pink), transparent);
+  }
+
+  /* Save button */
+  .save-btn {
+    display: inline-flex; align-items: center; gap: 7px;
+    margin-top: 14px;
+    padding: 9px 20px; border-radius: 999px;
+    border: 1.5px solid var(--rose);
+    background: var(--cream); color: var(--wine);
+    font-family: var(--sans); font-size: 13px; font-weight: 700;
+    cursor: pointer; transition: all 0.22s ease;
+    box-shadow: 0 2px 8px var(--shadow);
+  }
+  .save-btn:hover {
+    background: linear-gradient(135deg, var(--pink), var(--rose));
+    border-color: var(--rose); color: var(--wine);
+    box-shadow: 0 4px 14px rgba(232, 160, 168, 0.38);
+    transform: translateY(-1px);
+  }
+  .save-btn:active { transform: translateY(0); }
+
+  /* Tabs */
+  .tab-bar {
+    display: flex; flex-wrap: wrap; gap: 5px; padding: 5px;
+    background: var(--cream); border-radius: 18px;
+    border: 1px solid var(--border); margin-bottom: 20px;
+    box-shadow: 0 2px 12px var(--shadow);
+  }
+  .tab {
+    flex: 1 1 95px; min-width: 95px; padding: 10px 8px;
+    border: none; background: transparent;
+    font-size: 12.5px; font-weight: 700; color: var(--text-soft);
+    cursor: pointer; border-radius: 13px;
+    transition: all 0.25s ease; font-family: var(--sans);
+  }
+  .tab.active {
+    background: linear-gradient(135deg, var(--pink), var(--rose));
+    color: var(--wine); box-shadow: 0 2px 8px rgba(232, 160, 168, 0.33);
+  }
+
+  /* Card */
+  .card {
+    background: var(--cream); border-radius: 24px; padding: 26px 22px;
+    border: 1px solid var(--border);
+    box-shadow: 0 4px 24px var(--shadow);
+    position: relative; overflow: hidden;
+  }
+  .card::before {
+    content: ''; position: absolute; top: -50px; right: -50px;
+    width: 160px; height: 160px;
+    background: radial-gradient(circle, rgba(245, 205, 209, 0.4) 0%, transparent 70%);
+    border-radius: 50%; pointer-events: none;
+  }
+  .card::after {
+    content: ''; position: absolute; bottom: -40px; left: -40px;
+    width: 120px; height: 120px;
+    background: radial-gradient(circle, rgba(252, 232, 223, 0.8) 0%, transparent 70%);
+    border-radius: 50%; pointer-events: none;
+  }
+  .card-inner { position: relative; }
+
+  /* Headings */
+  h2.heading {
+    font-family: var(--serif);
+    font-size: 22px; font-weight: 500; color: var(--wine);
+    margin: 0 0 4px; display: flex; align-items: center; gap: 8px;
+  }
+  .heading-sub { font-size: 13px; color: var(--text-soft); margin: 0 0 18px; line-height: 1.5; }
+  h3.section-title {
+    font-family: var(--serif);
+    font-size: 15px; font-weight: 700; color: var(--deep-rose);
+    margin: 22px 0 10px; display: flex; align-items: center; gap: 6px;
+  }
+
+  /* Form */
+  .row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .field { flex: 1 1 140px; display: flex; flex-direction: column; gap: 6px; }
+  .label { font-size: 12px; font-weight: 700; color: var(--text); letter-spacing: 0.02em; }
+  .label-hint { font-size: 11px; color: var(--text-soft); font-weight: 400; font-style: italic; }
+  input[type="number"], input[type="text"], select {
+    padding: 10px 14px; border-radius: 12px;
+    border: 1.5px solid var(--border); background: var(--bg);
+    font-family: var(--sans); font-size: 15px; color: var(--text);
+    transition: border-color 0.2s ease; outline: none; width: 100%;
+  }
+  input:focus, select:focus { border-color: var(--rose); }
+  input[type=number]::-webkit-outer-spin-button,
+  input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=number] { -moz-appearance: textfield; }
+  select {
+    cursor: pointer; appearance: none; -webkit-appearance: none; padding-right: 36px;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23C77484'><path d='M7 10l5 5 5-5z'/></svg>");
+    background-repeat: no-repeat; background-position: right 10px center;
+  }
+
+  /* Chips */
+  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .chip {
+    padding: 6px 12px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--bg);
+    font-size: 12px; color: var(--text); cursor: pointer;
+    transition: all 0.2s ease; font-weight: 600; font-family: var(--sans);
+  }
+  .chip.active { background: var(--rose); color: var(--cream); border-color: var(--rose); }
+
+  /* Segmented control */
+  .seg-bar {
+    display: inline-flex; background: var(--bg); border-radius: 11px;
+    padding: 3px; border: 1px solid var(--border); gap: 2px;
+  }
+  .seg-btn {
+    padding: 7px 14px; border: none; background: transparent;
+    font-size: 13px; font-weight: 600; color: var(--text-soft);
+    cursor: pointer; border-radius: 8px; transition: all 0.2s ease; font-family: var(--sans);
+  }
+  .seg-btn.active { background: var(--cream); color: var(--wine); box-shadow: 0 1px 3px var(--shadow); }
+
+  /* Callout */
+  .callout {
+    background: linear-gradient(135deg, var(--pink-light), var(--bg));
+    border: 1px solid var(--pink); border-radius: 16px;
+    padding: 15px 18px; margin-top: 16px;
+  }
+  .callout-title {
+    font-family: var(--serif);
+    font-size: 15px; font-weight: 700; color: var(--wine);
+    margin: 0 0 6px; display: flex; align-items: center; gap: 6px;
+  }
+  .callout-body { font-size: 14px; color: var(--text); margin: 0; line-height: 1.55; }
+
+  /* Result */
+  .result {
+    background: linear-gradient(135deg, var(--pink), var(--rose));
+    border-radius: 18px; padding: 22px; margin-top: 18px;
+    color: var(--wine); box-shadow: 0 4px 16px rgba(232, 160, 168, 0.33);
+    position: relative; overflow: hidden;
+  }
+  .result-flower {
+    position: absolute; top: -20px; right: -10px; font-size: 70px;
+    opacity: 0.18; pointer-events: none;
+  }
+  .result-inner { position: relative; }
+  .result-label {
+    font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
+    font-weight: 700; opacity: 0.75; margin-bottom: 4px;
+  }
+  .result-value {
+    font-family: var(--serif);
+    font-size: 32px; font-weight: 500; line-height: 1.1; margin: 0 0 4px;
+  }
+  .result-hint { font-size: 13px; opacity: 0.85; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 10px; border-radius: 999px;
+    background: var(--pink-light); color: var(--deep-rose);
+    font-size: 12px; font-weight: 700; border: 1px solid var(--pink);
+  }
+
+  /* Table */
+  .mini-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  .mini-table th {
+    text-align: left; padding: 8px 10px; font-size: 11px;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--text-soft); font-weight: 700;
+    border-bottom: 1px solid var(--border);
+  }
+  .mini-table td { padding: 8px 10px; border-bottom: 1px solid rgba(236, 211, 213, 0.5); }
+
+  .footer {
+    text-align: center; margin-top: 28px; font-size: 13px;
+    color: var(--text-soft); font-style: italic; font-family: var(--serif);
+  }
+
+  /* Animations */
+  @keyframes sparkle {
+    0%, 100% { opacity: 0.35; transform: scale(0.85) rotate(0deg); }
+    50%      { opacity: 1;    transform: scale(1.1)  rotate(180deg); }
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-6px); }
+  }
+  .sparkle { animation: sparkle 3s ease-in-out infinite; display: inline-block; color: var(--gold); }
+  .fade-in { animation: fadeIn 0.35s ease-out; }
+  .float-anim { animation: float 5s ease-in-out infinite; display: inline-block; }
+  button { font-family: inherit; }
+  button:focus-visible, input:focus-visible, select:focus-visible {
+    outline: 2px solid var(--deep-rose); outline-offset: 2px;
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div class="container">
+  <header class="header">
+    <div class="eyebrow">knitting &amp; crochet atelier</div>
+    <h1 class="title">🍃 Garden Buddies 🌸</h1>
+    <p class="byline">by rie</p>
+    <p class="subtitle">gauge tools, blooming in your browser</p>
+    <div class="divider">
+      <div class="divider-line"></div>
+      <span class="float-anim">🌸</span>
+      <div class="divider-line"></div>
+    </div>
+    <button class="save-btn" id="saveBtn">
+      <span>🍃</span> Save to my device
+    </button>
+  </header>
+
+  <nav class="tab-bar" id="tabBar"><button class="tab active">🌸 Gauge</button><button class="tab">✨ Ease</button><button class="tab">🌷 Needles</button><button class="tab">🌸 Repeats</button><button class="tab">✨ Scaler</button><button class="tab">🌷 Yardage</button></nav>
+
+  <section class="card">
+    <div class="card-inner" id="tabContent"><div class="fade-in"><h2 class="heading">🌸 Gauge</h2><p class="heading-sub">Swatch once, knit in peace. Enter your gauge and the pattern's required gauge to compare.</p><div class="row"><div class="field"><label class="label">Measured over </label><div class="seg-bar"><button class="seg-btn active">4 inches</button><button class="seg-btn">10 cm</button></div></div><div class="field"><label class="label">Craft </label><div class="seg-bar"><button class="seg-btn active">Knit 🧶</button><button class="seg-btn">Crochet ✂</button></div></div></div><h3 class="section-title"><span>🌷</span>Your swatch</h3><div class="row"><div class="field"><label class="label">Stitches per 4 in </label><input type="number" value="" placeholder="e.g. 22" step="0.5" data-focus="gauge-mySts"></div><div class="field"><label class="label">Rows per 4 in <span class="label-hint">· optional</span></label><input type="number" value="" placeholder="e.g. 30" step="0.5" data-focus="gauge-myRows"></div></div><h3 class="section-title"><span>🌸</span>WIP pattern's required gauge</h3><div class="row"><div class="field"><label class="label">Sts per 4 in <span class="label-hint">· from pattern</span></label><input type="number" value="" placeholder="e.g. 20" step="0.5" data-focus="gauge-patSts"></div><div class="field"><label class="label">Rows per 4 in <span class="label-hint">· optional</span></label><input type="number" value="" placeholder="e.g. 28" step="0.5" data-focus="gauge-patRows"></div></div><div class="callout"><p class="callout-title"><span>💡</span>How to swatch well</p><div class="callout-body">Cast on at least 4 in wider than your measuring area, work in the pattern stitch the garment will use, bind off loosely, then <strong>wash and block exactly as you will the finished piece</strong>. Measure in the middle — edges lie to you.</div></div></div></div>
+  </section>
+
+  <footer class="footer">✦ happy making, rie ✦</footer>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ── SAVE BUTTON ──────────────────────────────────────────
+  document.getElementById('saveBtn').addEventListener('click', function () {
+    var html = '<!DOCTYPE html>' + document.documentElement.outerHTML;
+    var blob = new Blob([html], { type: 'text/html' });
+    var url  = URL.createObjectURL(blob);
+    var a    = document.createElement('a');
+    a.href     = url;
+    a.download = 'garden-buddies-by-rie.html';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  });
+
+  // ── STATE ────────────────────────────────────────────────
+  var state = {
+    activeTab: 'gauge',
+    gauge:   { mySts: '', myRows: '', patSts: '', patRows: '', unit: '4', craft: 'knit' },
+    ease:    { bodyMeas: '', ease: '2', measType: 'bust' },
+    needle:  { mySts: '', targetSts: '', currentNeedle: '' },
+    repeat:  { target: '', repeat: '4', mode: 'round', edge: '2' },
+    scaler:  { origGauge: '', newGauge: '', origSts: '', repeat: '', origRowGauge: '', newRowGauge: '', origRows: '' },
+    yardage: { width: '', length: '', stsGauge: '', rowsGauge: '', complexity: 'stockinette', weight: 'Worsted' }
+  };
+
+  // ── DATA ─────────────────────────────────────────────────
+  var YARN_WEIGHTS = [
+    { name: 'Lace',        num: 0, stsMin: 33, stsMax: 999, needleUS: '000-1',  needleMM: '1.5-2.25',  hookMM: '1.4-2.25' },
+    { name: 'Fingering',   num: 1, stsMin: 27, stsMax: 32,  needleUS: '1-3',    needleMM: '2.25-3.25', hookMM: '2.25-3.5' },
+    { name: 'Sport',       num: 2, stsMin: 23, stsMax: 26,  needleUS: '3-5',    needleMM: '3.25-3.75', hookMM: '3.5-4.5' },
+    { name: 'DK',          num: 3, stsMin: 21, stsMax: 22,  needleUS: '5-7',    needleMM: '3.75-4.5',  hookMM: '4.5-5.5' },
+    { name: 'Worsted',     num: 4, stsMin: 16, stsMax: 20,  needleUS: '7-9',    needleMM: '4.5-5.5',   hookMM: '5.5-6.5' },
+    { name: 'Bulky',       num: 5, stsMin: 12, stsMax: 15,  needleUS: '9-11',   needleMM: '5.5-8',     hookMM: '6.5-9' },
+    { name: 'Super Bulky', num: 6, stsMin: 7,  stsMax: 11,  needleUS: '11-17',  needleMM: '8-12.75',   hookMM: '9-15' },
+    { name: 'Jumbo',       num: 7, stsMin: 0,  stsMax: 6,   needleUS: '17+',    needleMM: '12.75+',    hookMM: '15+' }
+  ];
+
+  var REPEAT_PRESETS = [
+    { label: 'Stockinette',   repeat: 1 },
+    { label: 'Seed / Moss',   repeat: 2 },
+    { label: '1x1 Rib',       repeat: 2 },
+    { label: '2x2 Rib',       repeat: 4 },
+    { label: '3x3 Rib',       repeat: 6 },
+    { label: 'Basic Eyelet',  repeat: 6 },
+    { label: 'Feather & Fan', repeat: 18 },
+    { label: 'Cable 4',       repeat: 8 },
+    { label: 'Cable 6',       repeat: 12 },
+    { label: 'Garter Lace',   repeat: 4 }
+  ];
+
+  var EASE_CATEGORIES = [
+    { label: 'Very Negative', min: -20, max: -3, mid: -4, desc: 'Body-hugging, compression fit', emoji: '🌹' },
+    { label: 'Negative',      min: -3,  max: -1, mid: -2, desc: 'Snug, fitted silhouette',       emoji: '🌷' },
+    { label: 'Zero',          min: -1,  max: 1,  mid: 0,  desc: 'True to body, tailored',        emoji: '🌸' },
+    { label: 'Classic',       min: 1,   max: 3,  mid: 2,  desc: 'Skimming, comfortable',         emoji: '🌼' },
+    { label: 'Relaxed',       min: 3,   max: 5,  mid: 4,  desc: 'Loose, easy fit',               emoji: '🪷' },
+    { label: 'Oversized',     min: 5,   max: 100,mid: 6,  desc: 'Generous, slouchy',             emoji: '🌺' }
+  ];
+
+  var YARN_STS_PER_YARD = {
+    'Lace': 48, 'Fingering': 36, 'Sport': 28, 'DK': 23,
+    'Worsted': 17, 'Bulky': 12, 'Super Bulky': 8, 'Jumbo': 5
+  };
+
+  var COMPLEXITY = {
+    stockinette: { mult: 1.0,  label: 'Stockinette' },
+    ribbing:     { mult: 1.1,  label: 'Ribbing' },
+    cables:      { mult: 1.25, label: 'Cables' },
+    colorwork:   { mult: 1.5,  label: 'Colorwork' },
+    lace:        { mult: 0.9,  label: 'Lace' },
+    garter:      { mult: 1.15, label: 'Garter' }
+  };
+
+  var TABS = [
+    { id: 'gauge',   label: '🌸 Gauge'   },
+    { id: 'ease',    label: '✨ Ease'    },
+    { id: 'needle',  label: '🌷 Needles' },
+    { id: 'repeat',  label: '🌸 Repeats' },
+    { id: 'scaler',  label: '✨ Scaler'  },
+    { id: 'yardage', label: '🌷 Yardage' }
+  ];
+
+  var NEEDLE_TABLE = [
+    ['0', '2.0 mm', '14'], ['1', '2.25 mm', '13'], ['2', '2.75 mm', '12'],
+    ['3', '3.25 mm', '10'], ['4', '3.5 mm', '—'],  ['5', '3.75 mm', '9'],
+    ['6', '4.0 mm', '8'],  ['7', '4.5 mm', '7'],   ['8', '5.0 mm', '6'],
+    ['9', '5.5 mm', '5'],  ['10', '6.0 mm', '4'],  ['10½', '6.5 mm', '3'],
+    ['11', '8.0 mm', '0'], ['13', '9.0 mm', '00'], ['15', '10.0 mm', '000'],
+    ['17', '12.75 mm', '—'], ['19', '15.0 mm', '—'], ['35', '19.0 mm', '—']
+  ];
+
+  // ── HELPERS ──────────────────────────────────────────────
+  function detectWeight(sts) {
+    var s = Number(sts);
+    if (!s || s <= 0) return null;
+    for (var i = 0; i < YARN_WEIGHTS.length; i++) {
+      if (s >= YARN_WEIGHTS[i].stsMin && s <= YARN_WEIGHTS[i].stsMax) return YARN_WEIGHTS[i];
+    }
+    return null;
+  }
+
+  function getEaseCategory(ease) {
+    var e = Number(ease);
+    for (var i = 0; i < EASE_CATEGORIES.length; i++) {
+      var c = EASE_CATEGORIES[i];
+      if (e >= c.min && e < c.max) return c;
+    }
+    return EASE_CATEGORIES[3];
+  }
+
+  function h(tag, attrs, children) {
+    var el = document.createElement(tag);
+    if (attrs) {
+      for (var k in attrs) {
+        if (k === 'class') el.className = attrs[k];
+        else if (k === 'html') el.innerHTML = attrs[k];
+        else if (k.indexOf('on') === 0) el.addEventListener(k.substring(2), attrs[k]);
+        else if (attrs[k] !== null && attrs[k] !== undefined) el.setAttribute(k, attrs[k]);
+      }
+    }
+    if (children) {
+      if (!Array.isArray(children)) children = [children];
+      for (var j = 0; j < children.length; j++) {
+        var c = children[j];
+        if (c == null || c === false) continue;
+        if (typeof c === 'string' || typeof c === 'number') el.appendChild(document.createTextNode(String(c)));
+        else el.appendChild(c);
+      }
+    }
+    return el;
+  }
+
+  // ── REUSABLE COMPONENTS ──────────────────────────────────
+  function SectionHeading(icon, text) {
+    return h('h3', { class: 'section-title' }, [h('span', null, icon), text]);
+  }
+  function Row(children) { return h('div', { class: 'row' }, children); }
+  function Field(label, hint, control) {
+    var labelEl = h('label', { class: 'label' });
+    labelEl.appendChild(document.createTextNode(label + ' '));
+    if (hint) labelEl.appendChild(h('span', { class: 'label-hint' }, '· ' + hint));
+    return h('div', { class: 'field' }, [labelEl, control]);
+  }
+  function NumInput(tabKey, stateKey, placeholder, step, min) {
+    var input = h('input', {
+      type: 'number',
+      value: state[tabKey][stateKey],
+      placeholder: placeholder || '',
+      step: step || '1',
+      min: (min !== undefined ? min : null),
+      oninput: function (e) {
+        state[tabKey][stateKey] = e.target.value;
+        render();
+        setTimeout(function () {
+          var el = document.querySelector('[data-focus="' + tabKey + '-' + stateKey + '"]');
+          if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+        }, 0);
+      }
+    });
+    input.setAttribute('data-focus', tabKey + '-' + stateKey);
+    return input;
+  }
+  function TextInput(tabKey, stateKey, placeholder) {
+    var input = h('input', {
+      type: 'text',
+      value: state[tabKey][stateKey],
+      placeholder: placeholder || '',
+      oninput: function (e) {
+        state[tabKey][stateKey] = e.target.value;
+        render();
+        setTimeout(function () {
+          var el = document.querySelector('[data-focus="' + tabKey + '-' + stateKey + '"]');
+          if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+        }, 0);
+      }
+    });
+    input.setAttribute('data-focus', tabKey + '-' + stateKey);
+    return input;
+  }
+  function Callout(icon, title, bodyNodes) {
+    var titleEl = h('p', { class: 'callout-title' }, [h('span', null, icon || '✨'), title]);
+    var body = h('div', { class: 'callout-body' });
+    if (!Array.isArray(bodyNodes)) bodyNodes = [bodyNodes];
+    for (var i = 0; i < bodyNodes.length; i++) {
+      var n = bodyNodes[i];
+      if (typeof n === 'string') body.appendChild(document.createTextNode(n));
+      else if (n) body.appendChild(n);
+    }
+    return h('div', { class: 'callout' }, [titleEl, body]);
+  }
+  function Result(label, value, hint, flower) {
+    var inner = h('div', { class: 'result-inner' }, [
+      h('div', { class: 'result-label' }, label),
+      h('div', { class: 'result-value' }, String(value)),
+      hint ? h('div', { class: 'result-hint' }, hint) : null
+    ]);
+    return h('div', { class: 'result' }, [h('div', { class: 'result-flower' }, flower || '🌸'), inner]);
+  }
+  function SegControl(options, value, onChange) {
+    var bar = h('div', { class: 'seg-bar' });
+    for (var i = 0; i < options.length; i++) {
+      (function (opt) {
+        bar.appendChild(h('button', {
+          class: 'seg-btn' + (value === opt.value ? ' active' : ''),
+          onclick: function () { onChange(opt.value); }
+        }, opt.label));
+      })(options[i]);
+    }
+    return bar;
+  }
+  function Chip(label, active, onClick) {
+    return h('button', { class: 'chip' + (active ? ' active' : ''), onclick: onClick }, label);
+  }
+  function ChipRow(chips) { return h('div', { class: 'chip-row' }, chips); }
+  function strong(text) { return h('strong', null, text); }
+  function em(text)     { return h('em', null, text); }
+  function br()         { return h('br'); }
+
+  // ── TAB 1 — GAUGE ────────────────────────────────────────
+  function renderGauge() {
+    var s = state.gauge;
+    var myWeight  = detectWeight(s.mySts);
+    var patWeight = detectWeight(s.patSts);
+    var m = Number(s.mySts), p = Number(s.patSts);
+    var gaugeDiff = (m && p) ? (m - p) : null;
+    var mr = Number(s.myRows), pr = Number(s.patRows);
+    var rowDiff = (mr && pr) ? (mr - pr) : null;
+    var rec = null;
+    if (gaugeDiff !== null) {
+      if (Math.abs(gaugeDiff) < 0.5) {
+        rec = { title: 'Gauge matches 🌸', action: 'Cast on!',
+          text: 'Your swatch hits the pattern gauge. Block once more just to be sure.' };
+      } else {
+        var sz = Math.max(1, Math.round(Math.abs(gaugeDiff) / 1.5));
+        var pl = sz > 1 ? 's' : '';
+        rec = gaugeDiff > 0
+          ? { title: 'Go UP ' + sz + ' size' + pl, action: '⬆ ' + sz + ' size' + pl,
+              text: 'You have ' + gaugeDiff.toFixed(1) + ' more sts than the pattern — fabric is tight. Try a larger needle/hook.' }
+          : { title: 'Go DOWN ' + sz + ' size' + pl, action: '⬇ ' + sz + ' size' + pl,
+              text: 'You have ' + Math.abs(gaugeDiff).toFixed(1) + ' fewer sts — fabric is loose. Try a smaller needle/hook.' };
+      }
+    }
+    var unitLbl = s.unit === '4' ? '4 in' : '10 cm';
+    var out = [];
+    out.push(h('h2', { class: 'heading' }, '🌸 Gauge'));
+    out.push(h('p', { class: 'heading-sub' }, "Swatch once, knit in peace. Enter your gauge and the pattern's required gauge to compare."));
+    out.push(Row([
+      Field('Measured over', null, SegControl([{ value: '4', label: '4 inches' }, { value: '10', label: '10 cm' }], s.unit, function (v) { state.gauge.unit = v; render(); })),
+      Field('Craft', null, SegControl([{ value: 'knit', label: 'Knit 🧶' }, { value: 'crochet', label: 'Crochet ✂' }], s.craft, function (v) { state.gauge.craft = v; render(); }))
+    ]));
+    out.push(SectionHeading('🌷', 'Your swatch'));
+    out.push(Row([
+      Field('Stitches per ' + unitLbl, null, NumInput('gauge', 'mySts', 'e.g. 22', '0.5')),
+      Field('Rows per ' + unitLbl, 'optional', NumInput('gauge', 'myRows', 'e.g. 30', '0.5'))
+    ]));
+    out.push(SectionHeading('🌸', "WIP pattern's required gauge"));
+    out.push(Row([
+      Field('Sts per ' + unitLbl, 'from pattern', NumInput('gauge', 'patSts', 'e.g. 20', '0.5')),
+      Field('Rows per ' + unitLbl, 'optional', NumInput('gauge', 'patRows', 'e.g. 28', '0.5'))
+    ]));
+    if (myWeight) {
+      out.push(Callout('✨', 'Your yarn reads as…', [
+        h('strong', { style: 'color: var(--wine);' }, myWeight.name),
+        ' weight (category #' + myWeight.num + '). Recommended ' + (s.craft === 'knit' ? 'needles' : 'hook') + ': ',
+        h('span', { class: 'pill' }, s.craft === 'knit' ? 'US ' + myWeight.needleUS + ' · ' + myWeight.needleMM + ' mm' : myWeight.hookMM + ' mm')
+      ]));
+    }
+    if (rec) out.push(Result(rec.title, rec.action, rec.text));
+    if (gaugeDiff !== null && patWeight && myWeight && myWeight.name !== patWeight.name) {
+      out.push(Callout('🌹', 'Yarn weight mismatch', [
+        'Your yarn reads as ', strong(myWeight.name), ' but the pattern expects ', strong(patWeight.name),
+        ". Once you've tried a couple of needle sizes and can't reach gauge, consider substituting a closer-weight yarn."
+      ]));
+    }
+    if (rowDiff !== null && Math.abs(rowDiff) >= 0.5) {
+      out.push(Callout('🌼', 'Row gauge note', [
+        'Your row gauge is off by ', strong((rowDiff > 0 ? '+' : '') + rowDiff.toFixed(1)),
+        ' rows per ' + unitLbl + '. For length-measured patterns this is usually fine — knit to length. For row-counted sections (raglans, charts, short-rows), work to length where possible.'
+      ]));
+    }
+    if (gaugeDiff === null) {
+      out.push(Callout('💡', 'How to swatch well', [
+        'Cast on at least 4 in wider than your measuring area, work in the pattern stitch the garment will use, bind off loosely, then ',
+        strong('wash and block exactly as you will the finished piece'), '. Measure in the middle — edges lie to you.'
+      ]));
+    }
+    return h('div', { class: 'fade-in' }, out);
+  }
+
+  // ── TAB 2 — EASE ─────────────────────────────────────────
+  function renderEase() {
+    var s = state.ease;
+    var b = Number(s.bodyMeas), e = Number(s.ease);
+    var finished = b ? (b + e) : null;
+    var cat = getEaseCategory(s.ease);
+    var out = [];
+    out.push(h('h2', { class: 'heading' }, '✨ Ease Atelier'));
+    out.push(h('p', { class: 'heading-sub' }, 'Body measurement + desired ease = finished garment circumference.'));
+    out.push(SectionHeading('🌷', 'Where are you measuring?'));
+    out.push(ChipRow(['bust', 'waist', 'hip', 'upper arm', 'thigh'].map(function (m) {
+      return Chip(m, s.measType === m, function () { state.ease.measType = m; render(); });
+    })));
+    out.push(SectionHeading('🌸', 'Measurements'));
+    out.push(Row([
+      Field('Your ' + s.measType + ' (inches)', null, NumInput('ease', 'bodyMeas', 'e.g. 36', '0.25')),
+      Field('Ease (inches)', 'negative = snug, positive = loose', NumInput('ease', 'ease', 'e.g. 2', '0.25'))
+    ]));
+    out.push(SectionHeading('🌺', 'Quick ease presets'));
+    out.push(ChipRow(EASE_CATEGORIES.map(function (c) {
+      var active = e >= c.min && e < c.max;
+      return Chip(c.emoji + ' ' + c.label, active, function () { state.ease.ease = String(c.mid); render(); });
+    })));
+    if (finished !== null) {
+      out.push(Result('Finished ' + s.measType, finished.toFixed(2) + ' in',
+        cat.emoji + ' ' + cat.label + ' fit — ' + cat.desc.toLowerCase(), cat.emoji));
+      out.push(Callout('🌷', 'Fit preview', [
+        'With ', strong((e >= 0 ? '+' : '') + s.ease + ' in'), ' of ease on a ',
+        strong(s.bodyMeas + ' in'), ' ' + s.measType + ', your garment will measure ',
+        strong(finished.toFixed(2) + ' in'), ' around — a ', strong(cat.label.toLowerCase()), ' fit.'
+      ]));
+    }
+    out.push(Callout('💡', 'Ease cheat sheet', [
+      'Sweaters usually want ', strong('+1 to +4 in'), ' at the bust. Close-fitting tees and tanks sit at ',
+      strong('-2 to 0 in'), '. Shorts and leggings want ', strong('-2 to -4 in'), ' of negative ease for stretchy knits.'
+    ]));
+    return h('div', { class: 'fade-in' }, out);
+  }
+
+  // ── TAB 3 — NEEDLE SUB ───────────────────────────────────
+  function renderNeedle() {
+    var s = state.needle;
+    var m = Number(s.mySts), t = Number(s.targetSts);
+    var analysis = null;
+    if (m && t) {
+      var diff = m - t;
+      if (Math.abs(diff) < 0.5) {
+        analysis = { dir: 'match', sizes: 0, reason: 'Your gauge is already there — no change needed.' };
+      } else {
+        var sz = Math.max(1, Math.round(Math.abs(diff) / 1.5));
+        var pl = sz > 1 ? 's' : '';
+        analysis = { dir: diff > 0 ? 'up' : 'down', sizes: sz,
+          reason: diff > 0
+            ? "You're " + diff.toFixed(1) + ' sts tight — go up ' + sz + ' size' + pl + ' to loosen.'
+            : "You're " + Math.abs(diff).toFixed(1) + ' sts loose — go down ' + sz + ' size' + pl + ' to tighten.' };
+      }
+    }
+    var out = [];
+    out.push(h('h2', { class: 'heading' }, '🌷 Needle Substitution'));
+    out.push(h('p', { class: 'heading-sub' }, 'Swatch came out off? Figure out which direction to go and by how much.'));
+    out.push(Row([
+      Field('Your current sts / 4 in', null, NumInput('needle', 'mySts', 'e.g. 22', '0.5')),
+      Field('Pattern target sts / 4 in', null, NumInput('needle', 'targetSts', 'e.g. 20', '0.5'))
+    ]));
+    out.push(Field('Current needle / hook', 'optional, for reference', TextInput('needle', 'currentNeedle', 'e.g. US 7 or 4.5 mm')));
+    if (analysis) {
+      var val = analysis.dir === 'match' ? 'Perfect match 🌸'
+        : analysis.dir === 'up' ? 'Go up ' + analysis.sizes + ' size' + (analysis.sizes > 1 ? 's' : '') + ' ⬆'
+        : 'Go down ' + analysis.sizes + ' size' + (analysis.sizes > 1 ? 's' : '') + ' ⬇';
+      out.push(Result('Recommendation', val, analysis.reason + (s.currentNeedle ? ' From ' + s.currentNeedle + '.' : '')));
+    }
+    out.push(SectionHeading('✨', 'Needle size reference'));
+    var tbody = h('tbody');
+    for (var i = 0; i < NEEDLE_TABLE.length; i++) {
+      var r = NEEDLE_TABLE[i];
+      tbody.appendChild(h('tr', null, [h('td', null, r[0]), h('td', null, r[1]), h('td', null, r[2])]));
+    }
+    out.push(h('div', { style: 'overflow-x:auto;' }, h('table', { class: 'mini-table' }, [
+      h('thead', null, h('tr', null, [h('th', null, 'US'), h('th', null, 'Metric'), h('th', null, 'UK / CA')])),
+      tbody
+    ])));
+    out.push(Callout('💡', 'Rule of thumb', [
+      'One needle size ≈ ', strong('1 to 1.5 sts per 4 in'),
+      " of change. Fine yarns move the needle more than chunky ones. If you've gone 3+ sizes and still can't hit gauge, the yarn may simply be wrong for the pattern."
+    ]));
+    return h('div', { class: 'fade-in' }, out);
+  }
+
+  // ── TAB 4 — STITCH REPEAT ────────────────────────────────
+  function renderRepeat() {
+    var s = state.repeat;
+    var t = Number(s.target), r = Number(s.repeat), edge = Number(s.edge);
+    var result = null;
+    if (t && r && r >= 1) {
+      if (s.mode === 'round') {
+        var dn = Math.max(r, Math.floor(t / r) * r);
+        var up = Math.ceil(t / r) * r;
+        var cl = (t - dn) <= (up - t) ? dn : up;
+        result = { castOn: cl, down: dn, up: up, reps: cl / r, diff: cl - t, edgeSts: 0 };
+      } else {
+        var working = t - edge;
+        if (working >= r) {
+          var n1 = Math.floor(working / r), n2 = Math.ceil(working / r);
+          var v1 = n1 * r + edge, v2 = n2 * r + edge;
+          var cl2 = Math.abs(t - v1) <= Math.abs(t - v2) ? v1 : v2;
+          result = { castOn: cl2, down: v1, up: v2, reps: (cl2 - edge) / r, diff: cl2 - t, edgeSts: edge };
+        }
+      }
+    }
+    var out = [];
+    out.push(h('h2', { class: 'heading' }, '🌸 Stitch Repeat Resolver'));
+    out.push(h('p', { class: 'heading-sub' }, 'Find the nearest cast-on count that plays nicely with your pattern repeat.'));
+    out.push(Row([Field('Working', null, SegControl(
+      [{ value: 'round', label: 'In the round' }, { value: 'flat', label: 'Flat' }],
+      s.mode, function (v) { state.repeat.mode = v; render(); }
+    ))]));
+    out.push(Row([
+      Field('Target stitch count', null, NumInput('repeat', 'target', 'e.g. 160')),
+      Field('Repeat size', 'sts per repeat', NumInput('repeat', 'repeat', 'e.g. 4', '1', '1'))
+    ]));
+    if (s.mode === 'flat') {
+      out.push(Field('Edge / selvage stitches', 'outside the repeat, both sides combined', NumInput('repeat', 'edge', 'e.g. 2', '1', '0')));
+    }
+    out.push(SectionHeading('🌷', 'Common pattern repeats'));
+    out.push(ChipRow(REPEAT_PRESETS.map(function (p) {
+      return Chip(p.label + ' · ' + p.repeat, Number(s.repeat) === p.repeat,
+        function () { state.repeat.repeat = String(p.repeat); render(); });
+    })));
+    if (result) {
+      var hintTxt = result.reps + ' repeats' + (result.edgeSts ? ' + ' + result.edgeSts + ' edge sts' : '') + ' · ' +
+        (result.diff === 0 ? 'exact match ✨' : (result.diff > 0 ? '+' : '') + result.diff + ' from target');
+      out.push(Result('Closest valid cast-on', result.castOn + ' sts', hintTxt));
+      if (result.down !== result.up) {
+        out.push(Callout('✨', 'Nearby valid counts', [
+          'Round down: ', strong(result.down + ' sts'), ' · Round up: ', strong(result.up + ' sts'),
+          '. Pick whichever gives you the ease you want at your gauge.'
+        ]));
+      }
+    }
+    out.push(Callout('💡', 'About edge stitches', [
+      'For ', strong('flat'), ' work, edge stitches live outside the repeat — typically 1–2 sts on each side for a clean selvage or seaming allowance. Enter the total. In the round there are no edges, so this field disappears.'
+    ]));
+    return h('div', { class: 'fade-in' }, out);
+  }
+
+  // ── TAB 5 — PATTERN SCALER ───────────────────────────────
+  function renderScaler() {
+    var s = state.scaler;
+    var og = Number(s.origGauge), ng = Number(s.newGauge), os = Number(s.origSts);
+    var scaled = null;
+    if (og && ng && os) {
+      var raw = os * (ng / og);
+      var rounded = Math.round(raw);
+      var rep = Number(s.repeat);
+      var repeatAdj = null;
+      if (rep && rep > 0) {
+        var dn2 = Math.floor(rounded / rep) * rep;
+        var up2 = Math.ceil(rounded / rep) * rep;
+        repeatAdj = Math.abs(rounded - dn2) <= Math.abs(up2 - rounded) ? dn2 : up2;
+      }
+      scaled = { raw: raw, rounded: rounded, repeatAdj: repeatAdj };
+    }
+    var orow = Number(s.origRowGauge), nrow = Number(s.newRowGauge), ors = Number(s.origRows);
+    var scaledRows = (orow && nrow && ors) ? (function () { var rr = ors * (nrow / orow); return { raw: rr, rounded: Math.round(rr) }; })() : null;
+
+    var out = [];
+    out.push(h('h2', { class: 'heading' }, '✨ Pattern Scaler'));
+    out.push(h('p', { class: 'heading-sub' }, 'Adapt any pattern to a different yarn weight or your actual gauge.'));
+    out.push(SectionHeading('🌹', 'Stitches'));
+    out.push(Row([
+      Field("Pattern's sts / 4 in", null, NumInput('scaler', 'origGauge', 'e.g. 20', '0.5')),
+      Field('Your sts / 4 in', null, NumInput('scaler', 'newGauge', 'e.g. 22', '0.5'))
+    ]));
+    out.push(Row([
+      Field('Original stitch count', 'from pattern', NumInput('scaler', 'origSts', 'e.g. 168')),
+      Field('Pattern repeat', 'optional — snap to multiples', NumInput('scaler', 'repeat', 'e.g. 4', '1', '1'))
+    ]));
+    if (scaled) {
+      var val = scaled.repeatAdj != null ? scaled.repeatAdj : scaled.rounded;
+      var ht = (scaled.repeatAdj != null && scaled.repeatAdj !== scaled.rounded)
+        ? 'From ' + scaled.raw.toFixed(1) + ' → rounded to ' + scaled.rounded + ' → snapped to ' + scaled.repeatAdj + ' (repeat of ' + s.repeat + ')'
+        : 'Rounded from ' + scaled.raw.toFixed(1) + ' sts';
+      out.push(Result('Scaled stitch count', val, ht));
+    }
+    out.push(SectionHeading('🌼', 'Rows (optional)'));
+    out.push(Row([
+      Field("Pattern's rows / 4 in", null, NumInput('scaler', 'origRowGauge', 'e.g. 28', '0.5')),
+      Field('Your rows / 4 in', null, NumInput('scaler', 'newRowGauge', 'e.g. 30', '0.5'))
+    ]));
+    out.push(Field('Original row count', null, NumInput('scaler', 'origRows', 'e.g. 80')));
+    if (scaledRows) {
+      out.push(Callout('🌸', 'Scaled row count', [
+        'Work ', strong(scaledRows.rounded + ' rows'), ' at your row gauge to match the original length (from ' + scaledRows.raw.toFixed(1) + ').'
+      ]));
+    }
+    out.push(Callout('💡', 'Pro tip — shaping math', [
+      'Simple scaling works beautifully for straight tubes and flat panels. For shaped sections (armholes, necklines, waist decreases), scale the ', strong('ratio'),
+      ' of shaping, not the literal row count — keep the dec-per-inch rate roughly constant at your row gauge.'
+    ]));
+    return h('div', { class: 'fade-in' }, out);
+  }
+
+  // ── TAB 6 — YARDAGE ──────────────────────────────────────
+  function renderYardage() {
+    var s = state.yardage;
+    var w = Number(s.width), l = Number(s.length);
+    var stG = Number(s.stsGauge), rwG = Number(s.rowsGauge);
+    var estimate = null;
+    if (w && l && stG && rwG) {
+      var totalSts = (w * stG / 4) * (l * rwG / 4);
+      var stsPerYd = YARN_STS_PER_YARD[s.weight] || 20;
+      var base = totalSts / stsPerYd;
+      var adjusted = base * COMPLEXITY[s.complexity].mult;
+      estimate = { totalSts: Math.round(totalSts), base: Math.round(base), adjusted: Math.round(adjusted), withBuffer: Math.round(adjusted * 1.15) };
+    }
+    var out = [];
+    out.push(h('h2', { class: 'heading' }, '🌷 Yardage Estimator'));
+    out.push(h('p', { class: 'heading-sub' }, 'Know before you cast on — estimate yardage for a panel, sleeve, or whole project.'));
+    out.push(SectionHeading('🌸', 'Panel dimensions'));
+    out.push(Row([
+      Field('Width (inches)', null, NumInput('yardage', 'width', 'e.g. 20', '0.25')),
+      Field('Length (inches)', null, NumInput('yardage', 'length', 'e.g. 24', '0.25'))
+    ]));
+    out.push(SectionHeading('🌹', 'Your gauge'));
+    out.push(Row([
+      Field('Sts per 4 in', null, NumInput('yardage', 'stsGauge', 'e.g. 20', '0.5')),
+      Field('Rows per 4 in', null, NumInput('yardage', 'rowsGauge', 'e.g. 28', '0.5'))
+    ]));
+    out.push(SectionHeading('🌼', 'Yarn weight'));
+    var sel = h('select', { onchange: function (e) { state.yardage.weight = e.target.value; render(); } });
+    for (var i = 0; i < YARN_WEIGHTS.length; i++) {
+      var opt = h('option', { value: YARN_WEIGHTS[i].name }, YARN_WEIGHTS[i].name);
+      if (YARN_WEIGHTS[i].name === s.weight) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    out.push(Field('Select weight', null, sel));
+    out.push(SectionHeading('✨', 'Stitch complexity'));
+    var cchips = [];
+    for (var key in COMPLEXITY) {
+      (function (k) {
+        cchips.push(Chip(COMPLEXITY[k].label, s.complexity === k, function () { state.yardage.complexity = k; render(); }));
+      })(key);
+    }
+    out.push(ChipRow(cchips));
+    if (estimate) {
+      out.push(Result('Recommended yardage', estimate.withBuffer + ' yds',
+        '≈ ' + Math.round(estimate.withBuffer * 0.9144) + ' m · includes 15% safety buffer'));
+      out.push(Callout('🌷', 'Breakdown', [
+        'Total stitches: ', strong('~' + estimate.totalSts.toLocaleString()), br(),
+        'Base estimate: ', strong(estimate.base + ' yds'), br(),
+        'With ', em(COMPLEXITY[s.complexity].label.toLowerCase()), ' adjustment: ', strong(estimate.adjusted + ' yds'), br(),
+        '+ 15% safety buffer: ', strong(estimate.withBuffer + ' yds')
+      ]));
+      out.push(Callout('🌹', 'One more skein', [
+        'Always buy ', strong('at least one extra skein from the same dye lot'),
+        ' — frogging happens, and dye lots go out of stock fast.'
+      ]));
+    }
+    out.push(Callout('💡', 'How this works', [
+      'Total stitches = panel area × gauge, divided by approximate stitches-per-yard for your yarn weight. Complexity multipliers account for extra yarn eaten by cables, floats, and garter ridges.'
+    ]));
+    return h('div', { class: 'fade-in' }, out);
+  }
+
+  // ── RENDER ───────────────────────────────────────────────
+  var RENDERERS = { gauge: renderGauge, ease: renderEase, needle: renderNeedle, repeat: renderRepeat, scaler: renderScaler, yardage: renderYardage };
+
+  function render() {
+    var bar = document.getElementById('tabBar');
+    bar.innerHTML = '';
+    for (var i = 0; i < TABS.length; i++) {
+      (function (t) {
+        bar.appendChild(h('button', {
+          class: 'tab' + (state.activeTab === t.id ? ' active' : ''),
+          onclick: function () { state.activeTab = t.id; render(); }
+        }, t.label));
+      })(TABS[i]);
+    }
+    var content = document.getElementById('tabContent');
+    content.innerHTML = '';
+    content.appendChild(RENDERERS[state.activeTab]());
+  }
+
+  render();
+})();
+</script>
+
+
+
+</body></html>
